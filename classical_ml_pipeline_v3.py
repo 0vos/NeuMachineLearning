@@ -45,7 +45,7 @@ except ImportError:
 
 # Default relative paths
 BASE_DIR = Path(__file__).resolve().parent
-DEFAULT_DATASET_ROOT = BASE_DIR / "dataset-for-task1" / "dataset-for-task1"
+DEFAULT_DATASET_ROOT = BASE_DIR / "neu-plant-seedling-classification-2025" / "dataset-for-task1" / "dataset-for-task1"
 DEFAULT_TRAIN_DIR = DEFAULT_DATASET_ROOT / "train"
 def run_grouped_cv(
     base_pipeline: Pipeline,
@@ -354,89 +354,233 @@ def augment_image_and_mask(
 
 def get_color_features(image: np.ndarray, mask: np.ndarray) -> np.ndarray:
     """
-    Extract color moments and histogram from the masked area.
+    Enhanced color features from multiple color spaces.
+    Extracts: HSV moments, LAB moments, saturation distribution, color ratios.
     """
     if cv2.countNonZero(mask) == 0:
-        return np.zeros(15 + 24, dtype=np.float32) # Fallback if mask is empty
+        return np.zeros(70, dtype=np.float32)
 
-    # Apply mask
     masked_img = cv2.bitwise_and(image, image, mask=mask)
     
-    # Convert to HSV
+    # HSV color space - critical for plant color analysis
     hsv = cv2.cvtColor(masked_img, cv2.COLOR_RGB2HSV)
+    hsv_pixels = hsv[mask > 0]
     
-    # Extract pixels that are part of the plant
-    pixels = hsv[mask > 0]
+    # LAB color space - perceptually uniform, good for color differences
+    lab = cv2.cvtColor(masked_img, cv2.COLOR_RGB2LAB)
+    lab_pixels = lab[mask > 0]
     
-    if len(pixels) == 0:
-        return np.zeros(15 + 24, dtype=np.float32)
+    if len(hsv_pixels) == 0:
+        return np.zeros(70, dtype=np.float32)
 
-    # Moments: Mean, Std, Skew, Kurtosis (simplified to Mean, Std, Skew for H, S, V)
-    moments = []
-    for i in range(3): # H, S, V
-        channel_pixels = pixels[:, i]
-        moments.extend([np.mean(channel_pixels), np.std(channel_pixels), skew(channel_pixels)])
-        # Add min/max
-        moments.extend([np.min(channel_pixels), np.max(channel_pixels)]) # 5 features per channel -> 15 total
-        
-    # Histogram (H, S only usually matters most, but let's do all)
-    # We compute histogram only on the masked pixels
-    hist_h = cv2.calcHist([hsv], [0], mask, [8], [0, 180])
-    hist_s = cv2.calcHist([hsv], [1], mask, [8], [0, 256])
-    hist_v = cv2.calcHist([hsv], [2], mask, [8], [0, 256])
+    features = []
     
-    hist = np.concatenate([hist_h, hist_s, hist_v]).flatten()
-    cv2.normalize(hist, hist)
+    # HSV statistics (15 features)
+    for i in range(3):
+        channel = hsv_pixels[:, i].astype(np.float32)
+        features.extend([
+            np.mean(channel),
+            np.std(channel),
+            skew(channel),
+            np.min(channel),
+            np.max(channel)
+        ])
     
-    return np.concatenate([moments, hist])
+    # LAB statistics (15 features) - captures green intensity better
+    for i in range(3):
+        channel = lab_pixels[:, i].astype(np.float32)
+        features.extend([
+            np.mean(channel),
+            np.std(channel),
+            skew(channel),
+            np.min(channel),
+            np.max(channel)
+        ])
+    
+    # Saturation distribution analysis (3 features) - distinguishes vibrant vs pale leaves
+    s_channel = hsv_pixels[:, 1].astype(np.float32)
+    low_sat = np.sum(s_channel < 50) / len(s_channel)
+    mid_sat = np.sum((s_channel >= 50) & (s_channel < 150)) / len(s_channel)
+    high_sat = np.sum(s_channel >= 150) / len(s_channel)
+    features.extend([low_sat, mid_sat, high_sat])
+    
+    # Hue dominant ranges (3 features) - captures dominant color regions
+    h_channel = hsv_pixels[:, 0].astype(np.float32)
+    hue_ranges = [
+        np.sum((h_channel >= 25) & (h_channel < 45)) / len(h_channel),  # yellow-green
+        np.sum((h_channel >= 45) & (h_channel < 75)) / len(h_channel),  # green
+        np.sum((h_channel >= 75) & (h_channel < 95)) / len(h_channel),  # blue-green
+    ]
+    features.extend(hue_ranges)
+    
+    # Color channel ratios (3 features) - relative color strength
+    rgb_pixels = image[mask > 0].astype(np.float32)
+    r_mean, g_mean, b_mean = rgb_pixels.mean(axis=0)
+    total = r_mean + g_mean + b_mean + 1e-6
+    features.extend([r_mean/total, g_mean/total, b_mean/total])
+    
+    # Fine-grained histograms (24 features)
+    hist_h = cv2.calcHist([hsv], [0], mask, [8], [0, 180]).flatten()
+    hist_s = cv2.calcHist([hsv], [1], mask, [8], [0, 256]).flatten()
+    hist_v = cv2.calcHist([hsv], [2], mask, [8], [0, 256]).flatten()
+    
+    hist = np.concatenate([hist_h, hist_s, hist_v])
+    hist = hist / (np.sum(hist) + 1e-6)
+    features.extend(hist.tolist())
+    
+    # Excess green index (1 feature) - discriminates greenness
+    exg = 2 * g_mean - r_mean - b_mean
+    features.append(exg / 255.0)
+    
+    # Color variance spatial analysis (6 features)
+    for channel_idx in range(3):
+        channel_img = hsv[:, :, channel_idx]
+        channel_masked = channel_img[mask > 0]
+        if len(channel_masked) > 0:
+            features.append(np.percentile(channel_masked, 90) - np.percentile(channel_masked, 10))
+    
+    return np.array(features[:70], dtype=np.float32)
 
 
 def get_texture_features(image: np.ndarray, mask: np.ndarray) -> np.ndarray:
-    """Haralick features on masked gray image."""
+    """
+    Enhanced multi-scale texture features.
+    Combines: Haralick GLCM, multi-scale Canny edges, gradient statistics, Laplacian.
+    """
     gray = cv2.cvtColor(image, cv2.COLOR_RGB2GRAY)
-    # We can't easily apply mask to GLCM directly as it's rectangular.
-    # But we can set background to 0 and plant to values > 0.
-    # Or better: Extract a bounding box around the mask?
-    # For simplicity, we'll just run GLCM on the whole image but masked background set to 0.
-    # Note: Background 0s will create strong GLCM entries at (0,0). We might want to ignore them.
-    # A better approach for texture in this context might be simple statistics of gradients or just using the whole patch.
-    # Let's stick to the previous Haralick implementation but maybe on the bounding box of the plant.
-    
-    # Find bounding box
     coords = cv2.findNonZero(mask)
+    
     if coords is None:
-        return np.zeros(12, dtype=np.float32)
-        
+        return np.zeros(45, dtype=np.float32)
+    
+    features = []
+    
+    # 1. Haralick GLCM features (12 features)
     x, y, w, h = cv2.boundingRect(coords)
     roi = gray[y:y+h, x:x+w]
+    roi_quantized = (roi // 8).astype(np.uint8)
     
-    # Quantize
-    roi = (roi // 8).astype(np.uint8)
-    
-    # GLCM
     try:
-        glcm = graycomatrix(roi, distances=[1, 2], angles=[0, np.pi/2], levels=32, symmetric=True, normed=True)
+        glcm = graycomatrix(roi_quantized, distances=[1, 2], angles=[0, np.pi/2], levels=32, symmetric=True, normed=True)
         props = ['contrast', 'dissimilarity', 'homogeneity', 'energy', 'correlation', 'ASM']
-        feats = []
         for prop in props:
             val = graycoprops(glcm, prop).ravel()
-            feats.extend([val.mean(), val.std()]) # 6 props * 2 stats = 12 features
-            
-        return np.array(feats)
+            features.extend([val.mean(), val.std()])
     except ValueError:
-        return np.zeros(12, dtype=np.float32)
+        features.extend([0.0] * 12)
+    
+    # 2. Multi-scale edge density (6 features) - captures leaf edge complexity at different scales
+    for threshold1, threshold2 in [(50, 150), (100, 200), (150, 250)]:
+        edges = cv2.Canny(gray, threshold1, threshold2)
+        edge_density = np.sum((edges > 0) & (mask > 0)) / (cv2.countNonZero(mask) + 1e-6)
+        edge_strength = np.mean(edges[mask > 0]) if np.any(mask) else 0.0
+        features.extend([edge_density, edge_strength / 255.0])
+    
+    # 3. Gradient magnitude statistics (6 features)
+    sobelx = cv2.Sobel(gray, cv2.CV_32F, 1, 0, ksize=3)
+    sobely = cv2.Sobel(gray, cv2.CV_32F, 0, 1, ksize=3)
+    gradient_mag = np.sqrt(sobelx**2 + sobely**2)
+    grad_pixels = gradient_mag[mask > 0]
+    if len(grad_pixels) > 0:
+        features.extend([
+            np.mean(grad_pixels) / 255.0,
+            np.std(grad_pixels) / 255.0,
+            np.median(grad_pixels) / 255.0,
+            np.percentile(grad_pixels, 25) / 255.0,
+            np.percentile(grad_pixels, 75) / 255.0,
+            np.max(grad_pixels) / 255.0
+        ])
+    else:
+        features.extend([0.0] * 6)
+    
+    # 4. Laplacian variance at multiple scales (3 features) - focus/sharpness measure
+    for ksize in [3, 5, 7]:
+        laplacian = cv2.Laplacian(gray, cv2.CV_32F, ksize=ksize)
+        lap_var = np.var(laplacian[mask > 0]) if np.any(mask) else 0.0
+        features.append(lap_var / 10000.0)
+    
+    # 5. Local intensity variation (3 features)
+    blurred = cv2.GaussianBlur(gray, (5, 5), 0)
+    diff = np.abs(gray.astype(np.float32) - blurred.astype(np.float32))
+    diff_pixels = diff[mask > 0]
+    if len(diff_pixels) > 0:
+        features.extend([
+            np.mean(diff_pixels) / 255.0,
+            np.std(diff_pixels) / 255.0,
+            np.max(diff_pixels) / 255.0
+        ])
+    else:
+        features.extend([0.0] * 3)
+    
+    # 6. Entropy (1 feature) - texture complexity
+    roi_pixels = roi.flatten()
+    if len(roi_pixels) > 0:
+        hist, _ = np.histogram(roi_pixels, bins=32, range=(0, 256))
+        hist = hist / (hist.sum() + 1e-6)
+        entropy = -np.sum(hist * np.log2(hist + 1e-6))
+        features.append(entropy / 5.0)
+    else:
+        features.append(0.0)
+    
+    # 7. Directional gradients (8 features) - edge orientation strength
+    for angle in [0, 45, 90, 135]:
+        theta = np.radians(angle)
+        kx = np.cos(theta)
+        ky = np.sin(theta)
+        grad_dir = sobelx * kx + sobely * ky
+        dir_pixels = grad_dir[mask > 0]
+        if len(dir_pixels) > 0:
+            features.extend([
+                np.mean(np.abs(dir_pixels)) / 255.0,
+                np.std(dir_pixels) / 255.0
+            ])
+        else:
+            features.extend([0.0, 0.0])
+    
+    # 8. High frequency content (6 features) - fine texture details
+    gray_float = gray.astype(np.float32)
+    # Apply high-pass filters
+    kernel_hp = np.array([[-1, -1, -1], [-1, 8, -1], [-1, -1, -1]])
+    high_freq = cv2.filter2D(gray_float, -1, kernel_hp)
+    hf_pixels = high_freq[mask > 0]
+    if len(hf_pixels) > 0:
+        features.extend([
+            np.mean(np.abs(hf_pixels)) / 255.0,
+            np.std(hf_pixels) / 255.0,
+            np.percentile(np.abs(hf_pixels), 90) / 255.0
+        ])
+    else:
+        features.extend([0.0] * 3)
+    
+    # Different kernel
+    kernel_hp2 = np.array([[0, -1, 0], [-1, 5, -1], [0, -1, 0]])
+    high_freq2 = cv2.filter2D(gray_float, -1, kernel_hp2)
+    hf2_pixels = high_freq2[mask > 0]
+    if len(hf2_pixels) > 0:
+        features.extend([
+            np.mean(np.abs(hf2_pixels)) / 255.0,
+            np.std(hf2_pixels) / 255.0,
+            np.max(np.abs(hf2_pixels)) / 255.0
+        ])
+    else:
+        features.extend([0.0] * 3)
+    
+    return np.array(features[:45], dtype=np.float32)
 
 
 def get_shape_features(mask: np.ndarray) -> np.ndarray:
-    """Shape + skeleton descriptors from the binary mask."""
+    """Enhanced shape features with convex hull, multi-scale morphology, and ellipse fitting."""
     total_pixels = mask.size
     area = float(cv2.countNonZero(mask))
     area_ratio = area / total_pixels if total_pixels else 0.0
 
     coords = cv2.findNonZero(mask)
     if coords is None or area == 0:
-        return np.zeros(17, dtype=np.float32)
+        return np.zeros(45, dtype=np.float32)
 
+    features = []
+    
+    # 1. Basic geometric features
     x, y, w, h = cv2.boundingRect(coords)
     bbox_area = float(w * h) if w and h else 1.0
     extent = area / bbox_area if bbox_area else 0.0
@@ -445,15 +589,54 @@ def get_shape_features(mask: np.ndarray) -> np.ndarray:
 
     contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     perimeter = 0.0
+    main_contour = None
     if contours:
-        perimeter = cv2.arcLength(max(contours, key=cv2.contourArea), True)
+        main_contour = max(contours, key=cv2.contourArea)
+        perimeter = cv2.arcLength(main_contour, True)
     circularity = (4 * np.pi * area / (perimeter ** 2)) if perimeter > 0 else 0.0
-
+    
+    features.extend([
+        area_ratio, extent, aspect_ratio, equiv_diameter, circularity,
+        perimeter / (mask.shape[0] + mask.shape[1]),
+        w / max(mask.shape), h / max(mask.shape)
+    ])
+    
+    # 2. Convex hull analysis
+    if contours and main_contour is not None:
+        hull = cv2.convexHull(main_contour)
+        hull_area = cv2.contourArea(hull)
+        solidity = area / (hull_area + 1e-6)
+        hull_perimeter = cv2.arcLength(hull, True)
+        convexity = hull_perimeter / (perimeter + 1e-6)
+        
+        hull_indices = cv2.convexHull(main_contour, returnPoints=False)
+        if len(hull_indices) > 3 and len(main_contour) > 3:
+            try:
+                defects = cv2.convexityDefects(main_contour, hull_indices)
+                if defects is not None:
+                    defect_depths = defects[:, 0, 3] / 256.0
+                    avg_defect = np.mean(defect_depths) / max(mask.shape)
+                    max_defect = np.max(defect_depths) / max(mask.shape)
+                    num_defects = len(defects) / 100.0
+                else:
+                    avg_defect = max_defect = num_defects = 0.0
+            except:
+                avg_defect = max_defect = num_defects = 0.0
+        else:
+            avg_defect = max_defect = num_defects = 0.0
+            
+        features.extend([solidity, convexity, avg_defect, max_defect, num_defects, 
+                        hull_area / total_pixels, (hull_area - area) / (area + 1e-6)])
+    else:
+        features.extend([0.0] * 7)
+    
+    # 3. Hu moments
     moments = cv2.moments(mask)
     hu = cv2.HuMoments(moments).flatten()
     hu = np.sign(hu) * np.log1p(np.abs(hu))
-
-    # Skeleton-based descriptors capture thin structures
+    features.extend(hu.tolist())
+    
+    # 4. Skeleton analysis
     binary = (mask > 0).astype(np.uint8)
     skeleton = skeletonize(binary).astype(np.uint8)
     skeleton_length = float(skeleton.sum())
@@ -464,29 +647,72 @@ def get_shape_features(mask: np.ndarray) -> np.ndarray:
     neighbor_count = convolve(skeleton, kernel, mode="constant", cval=0)
     endpoints = float(np.sum((skeleton == 1) & (neighbor_count == 2)))
     junctions = float(np.sum((skeleton == 1) & (neighbor_count >= 4)))
+    branches = float(np.sum((skeleton == 1) & (neighbor_count == 3)))
     endpoint_density = endpoints / (skeleton_length + 1e-6)
     junction_density = junctions / (skeleton_length + 1e-6)
+    
+    features.extend([length_ratio, norm_length, endpoint_density, junction_density, 
+                     endpoints / 100.0, junctions / 50.0, branches / 50.0])
+    
+    # 5. Multi-scale morphological features
+    for kernel_size in [3, 7, 15]:
+        kernel_morph = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kernel_size, kernel_size))
+        opened = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel_morph)
+        closed = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel_morph)
+        open_ratio = cv2.countNonZero(opened) / (area + 1e-6)
+        close_diff = (cv2.countNonZero(closed) - area) / total_pixels
+        features.extend([open_ratio, close_diff])
+    
+    # 6. Eccentricity and ellipse fitting
+    if moments['mu20'] + moments['mu02'] > 0:
+        eccentricity = np.sqrt(1 - (moments['mu20'] - moments['mu02'])**2 / (moments['mu20'] + moments['mu02'])**2)
+    else:
+        eccentricity = 0.0
+    
+    if main_contour is not None and len(main_contour) >= 5:
+        try:
+            ellipse = cv2.fitEllipse(main_contour)
+            ellipse_ratio = min(ellipse[1]) / (max(ellipse[1]) + 1e-6)
+            ellipse_area = np.pi * ellipse[1][0] * ellipse[1][1] / 4.0
+            ellipse_fill = area / (ellipse_area + 1e-6)
+        except:
+            ellipse_ratio = ellipse_fill = 0.0
+    else:
+        ellipse_ratio = ellipse_fill = 0.0
+    
+    features.extend([eccentricity, ellipse_ratio, ellipse_fill])
+    
+    # 7. Compactness variations
+    iso_quotient = (4 * np.pi * area) / (perimeter ** 2 + 1e-6)
+    roughness = perimeter / (2 * np.sqrt(np.pi * area) + 1e-6)
+    rectangularity = area / (bbox_area + 1e-6)
+    shape_factor = (perimeter ** 2) / (area + 1e-6)
+    
+    features.extend([iso_quotient, roughness, rectangularity, shape_factor / 100.0])
+    
+    # 8. Distance transform statistics
+    dist = cv2.distanceTransform(mask, cv2.DIST_L2, 5)
+    dist_values = dist[mask > 0]
+    if len(dist_values) > 0:
+        features.extend([
+            np.mean(dist_values) / max(mask.shape),
+            np.std(dist_values) / max(mask.shape),
+            np.max(dist_values) / max(mask.shape)
+        ])
+    else:
+        features.extend([0.0] * 3)
+    
+    return np.array(features[:45], dtype=np.float32)
 
-    return np.array([
-        area_ratio,
-        extent,
-        aspect_ratio,
-        equiv_diameter,
-        circularity,
-        perimeter / (mask.shape[0] + mask.shape[1]),
-        length_ratio,
-        norm_length,
-        endpoint_density,
-        junction_density,
-        *hu.tolist(),
-    ], dtype=np.float32)
+
+
 
 
 def get_width_features(mask: np.ndarray) -> np.ndarray:
-    """Estimate leaf widths via distance transform sampled on the skeleton."""
+    """Enhanced width features via distance transform with percentiles."""
     binary = (mask > 0).astype(np.uint8)
     if not np.any(binary):
-        return np.zeros(3, dtype=np.float32)
+        return np.zeros(7, dtype=np.float32)
 
     dist = cv2.distanceTransform(binary, cv2.DIST_L2, 5)
     skeleton = skeletonize(binary).astype(bool)
@@ -495,11 +721,225 @@ def get_width_features(mask: np.ndarray) -> np.ndarray:
         samples = dist[binary > 0]
     widths = samples * 2.0  # approximate diameter
     norm = max(mask.shape)
-    return np.array([
-        widths.mean() / norm,
-        widths.std() / norm,
-        widths.max() / norm,
+    
+    if len(widths) > 0:
+        return np.array([
+            widths.mean() / norm,
+            widths.std() / norm,
+            widths.max() / norm,
+            widths.min() / norm,
+            np.median(widths) / norm,
+            np.percentile(widths, 25) / norm,
+            np.percentile(widths, 75) / norm,
+        ], dtype=np.float32)
+    else:
+        return np.zeros(7, dtype=np.float32)
+
+
+def get_radial_features(mask: np.ndarray, num_bins: int = 16) -> np.ndarray:
+    """Radial signature of contour distances from centroid across angles."""
+    coords = cv2.findNonZero(mask)
+    if coords is None or cv2.countNonZero(mask) == 0:
+        return np.zeros(num_bins + 4, dtype=np.float32)
+
+    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if not contours:
+        return np.zeros(num_bins + 4, dtype=np.float32)
+
+    main_contour = max(contours, key=cv2.contourArea)
+    moments = cv2.moments(main_contour)
+    if moments["m00"] == 0:
+        return np.zeros(num_bins + 4, dtype=np.float32)
+
+    cx = moments["m10"] / moments["m00"]
+    cy = moments["m01"] / moments["m00"]
+    points = main_contour[:, 0, :].astype(np.float32)
+    vectors = points - np.array([[cx, cy]], dtype=np.float32)
+    angles = (np.arctan2(vectors[:, 1], vectors[:, 0]) + 2 * np.pi) % (2 * np.pi)
+    distances = np.linalg.norm(vectors, axis=1)
+
+    radial_hist = np.zeros(num_bins, dtype=np.float32)
+    bin_indices = np.floor(angles / (2 * np.pi) * num_bins).astype(int)
+    bin_indices = np.clip(bin_indices, 0, num_bins - 1)
+    for idx, dist_val in zip(bin_indices, distances):
+        if dist_val > radial_hist[idx]:
+            radial_hist[idx] = dist_val
+
+    norm = float(max(mask.shape)) or 1.0
+    radial_hist /= norm
+    stats = np.array([
+        radial_hist.mean(),
+        radial_hist.std(),
+        radial_hist.max(),
+        radial_hist.min(),
     ], dtype=np.float32)
+    return np.concatenate([radial_hist, stats])
+
+
+def get_hole_features(mask: np.ndarray) -> np.ndarray:
+    """Capture internal hole statistics to describe complex leaf shapes."""
+    area = float(cv2.countNonZero(mask))
+    if area == 0:
+        return np.zeros(5, dtype=np.float32)
+
+    contours, hierarchy = cv2.findContours(mask, cv2.RETR_CCOMP, cv2.CHAIN_APPROX_SIMPLE)
+    if hierarchy is None:
+        return np.zeros(5, dtype=np.float32)
+
+    hole_areas: List[float] = []
+    circularities: List[float] = []
+    for idx, node in enumerate(hierarchy[0]):
+        parent = node[3]
+        if parent != -1:  # child contour -> hole
+            hole_area = cv2.contourArea(contours[idx])
+            if hole_area <= 0:
+                continue
+            hole_areas.append(hole_area)
+            perim = cv2.arcLength(contours[idx], True)
+            circ = (4 * np.pi * hole_area) / (perim ** 2 + 1e-6)
+            circularities.append(circ)
+
+    if not hole_areas:
+        return np.zeros(5, dtype=np.float32)
+
+    hole_areas_np = np.array(hole_areas, dtype=np.float32)
+    total_hole_area = hole_areas_np.sum()
+    largest_hole = hole_areas_np.max()
+
+    return np.array([
+        len(hole_areas) / 10.0,
+        total_hole_area / (area + 1e-6),
+        largest_hole / (area + 1e-6),
+        float(np.mean(circularities)) if circularities else 0.0,
+        float(np.std(hole_areas_np) / (area + 1e-6)),
+    ], dtype=np.float32)
+
+
+def get_channel_gradient_features(image: np.ndarray, mask: np.ndarray) -> np.ndarray:
+    """Color-channel gradient statistics that capture venation intensity."""
+    if cv2.countNonZero(mask) == 0:
+        return np.zeros(11, dtype=np.float32)
+
+    mask_bool = mask.astype(bool)
+    channel_means: List[float] = []
+    feats: List[float] = []
+    for ch in range(3):
+        channel = image[:, :, ch].astype(np.float32)
+        sobelx = cv2.Sobel(channel, cv2.CV_32F, 1, 0, ksize=3)
+        sobely = cv2.Sobel(channel, cv2.CV_32F, 0, 1, ksize=3)
+        magnitude = np.sqrt(sobelx ** 2 + sobely ** 2)
+        values = magnitude[mask_bool]
+        if values.size == 0:
+            feats.extend([0.0, 0.0, 0.0])
+            channel_means.append(0.0)
+        else:
+            feats.extend([
+                float(np.mean(values) / 255.0),
+                float(np.std(values) / 255.0),
+                float(np.max(values) / 255.0),
+            ])
+            channel_means.append(float(np.mean(values)))
+
+    # Relative gradient strength between channels (green vs others)
+    g = channel_means[1] if len(channel_means) > 1 else 0.0
+    r = channel_means[0] if channel_means else 0.0
+    b = channel_means[2] if len(channel_means) > 2 else 0.0
+    green_red_ratio = (g - r) / (g + r + 1e-6)
+    green_blue_ratio = (g - b) / (g + b + 1e-6)
+    feats.extend([green_red_ratio, green_blue_ratio])
+    return np.array(feats, dtype=np.float32)
+
+
+def get_frequency_features(image: np.ndarray, mask: np.ndarray, target_size: int = 128) -> np.ndarray:
+    """Frequency-domain energy distribution for masked grayscale texture."""
+    if cv2.countNonZero(mask) == 0:
+        return np.zeros(5, dtype=np.float32)
+
+    gray = cv2.cvtColor(image, cv2.COLOR_RGB2GRAY)
+    resized = cv2.resize(gray, (target_size, target_size), interpolation=cv2.INTER_AREA)
+    mask_resized = cv2.resize(mask, (target_size, target_size), interpolation=cv2.INTER_NEAREST)
+    masked = resized.astype(np.float32) * (mask_resized > 0)
+
+    spectrum = np.fft.fftshift(np.fft.fft2(masked))
+    magnitude = np.abs(spectrum)
+    energy = magnitude ** 2
+    total_energy = energy.sum() + 1e-6
+
+    rows, cols = energy.shape
+    cy, cx = (rows - 1) / 2.0, (cols - 1) / 2.0
+    y_grid, x_grid = np.ogrid[:rows, :cols]
+    radius = np.sqrt((y_grid - cy) ** 2 + (x_grid - cx) ** 2)
+    radius_norm = radius / (radius.max() + 1e-6)
+
+    low = energy[radius_norm < 0.3].sum() / total_energy
+    mid = energy[(radius_norm >= 0.3) & (radius_norm < 0.6)].sum() / total_energy
+    high = energy[radius_norm >= 0.6].sum() / total_energy
+
+    spectral_centroid = float((radius_norm * energy).sum() / total_energy)
+    flattened = (energy / total_energy).ravel()
+    spectral_entropy = float(-(flattened * np.log2(flattened + 1e-9)).sum())
+
+    return np.array([low, mid, high, spectral_centroid, spectral_entropy], dtype=np.float32)
+
+
+def get_multiscale_features(image: np.ndarray, mask: np.ndarray) -> np.ndarray:
+    """
+    Extract features at multiple scales to capture both fine details and overall structure.
+    Resizes image to different scales and computes basic statistics.
+    """
+    if cv2.countNonZero(mask) == 0:
+        return np.zeros(15, dtype=np.float32)
+    
+    features = []
+    
+    # Original scale statistics
+    hsv = cv2.cvtColor(image, cv2.COLOR_RGB2HSV)
+    masked_pixels = hsv[mask > 0]
+    
+    if len(masked_pixels) == 0:
+        return np.zeros(15, dtype=np.float32)
+    
+    # Multi-scale analysis
+    scales = [0.5, 1.0, 2.0]
+    for scale in scales:
+        if scale != 1.0:
+            h, w = image.shape[:2]
+            new_size = (int(w * scale), int(h * scale))
+            img_scaled = cv2.resize(image, new_size, interpolation=cv2.INTER_LINEAR if scale > 1.0 else cv2.INTER_AREA)
+            mask_scaled = cv2.resize(mask, new_size, interpolation=cv2.INTER_NEAREST)
+        else:
+            img_scaled = image
+            mask_scaled = mask
+        
+        # Compute edge density at this scale
+        gray_scaled = cv2.cvtColor(img_scaled, cv2.COLOR_RGB2GRAY)
+        edges = cv2.Canny(gray_scaled, 100, 200)
+        edge_density = np.sum((edges > 0) & (mask_scaled > 0)) / (cv2.countNonZero(mask_scaled) + 1e-6)
+        
+        # Compute color variance at this scale
+        hsv_scaled = cv2.cvtColor(img_scaled, cv2.COLOR_RGB2HSV)
+        h_variance = np.var(hsv_scaled[:, :, 0][mask_scaled > 0]) if np.any(mask_scaled) else 0.0
+        s_mean = np.mean(hsv_scaled[:, :, 1][mask_scaled > 0]) if np.any(mask_scaled) else 0.0
+        
+        features.extend([edge_density, h_variance / 1000.0, s_mean / 255.0])
+    
+    # Pyramid features - capture hierarchical structure
+    gray = cv2.cvtColor(image, cv2.COLOR_RGB2GRAY)
+    pyr_down = cv2.pyrDown(gray)
+    pyr_up = cv2.pyrUp(pyr_down, dstsize=(gray.shape[1], gray.shape[0]))
+    detail = cv2.absdiff(gray, pyr_up)
+    detail_pixels = detail[mask > 0]
+    
+    if len(detail_pixels) > 0:
+        features.extend([
+            np.mean(detail_pixels) / 255.0,
+            np.std(detail_pixels) / 255.0,
+            np.max(detail_pixels) / 255.0
+        ])
+    else:
+        features.extend([0.0] * 3)
+    
+    return np.array(features[:15], dtype=np.float32)
 
 
 def get_orientation_features(image: np.ndarray, mask: np.ndarray, bins: int = 12) -> np.ndarray:
@@ -693,20 +1133,33 @@ def main(argv: Sequence[str] | None = None) -> None:
             # Color
             feat_color = get_color_features(img, mask)
             
-            # Texture
+            # Texture (45 features)
             feat_texture = get_texture_features(img, mask)
 
-            # Shape
+            # Shape (45 features)
             feat_shape = get_shape_features(mask)
 
-            # Width
+            # Width (7 features)
             feat_width = get_width_features(mask)
 
-            # Orientation
+            # Radial signature (20 features) & hole stats (5 features)
+            feat_radial = get_radial_features(mask)
+            feat_holes = get_hole_features(mask)
+
+            # Color-channel gradients (11 features)
+            feat_channel_grad = get_channel_gradient_features(img, mask)
+
+            # Orientation (12 features)
             feat_orientation = get_orientation_features(img, mask)
 
-            # LBP
+            # LBP (26 features)
             feat_lbp = get_lbp_features(img, mask)
+            
+            # Multi-scale (15 features)
+            feat_multiscale = get_multiscale_features(img, mask)
+
+            # Frequency-domain texture (5 features)
+            feat_frequency = get_frequency_features(img, mask)
             
             # BoVW
             if descriptors_list is not None:
@@ -721,13 +1174,18 @@ def main(argv: Sequence[str] | None = None) -> None:
                 feat_bovw = np.zeros(args.vocab_size, dtype=np.float32)
 
             feature_parts = [
-                feat_color,
-                feat_texture,
-                feat_shape,
-                feat_width,
-                feat_orientation,
-                feat_lbp,
-                feat_bovw,
+                feat_color,        # 70 features
+                feat_texture,      # 45 features
+                feat_shape,        # 45 features
+                feat_width,        # 7 features
+                feat_radial,       # 20 features
+                feat_holes,        # 5 features
+                feat_channel_grad, # 11 features
+                feat_orientation,  # 12 features
+                feat_lbp,          # 26 features
+                feat_multiscale,   # 15 features
+                feat_frequency,    # 5 features
+                feat_bovw,         # vocab_size features (default 100)
             ]
 
             if orb_kmeans is not None and orb is not None:
