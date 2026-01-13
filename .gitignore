@@ -30,6 +30,7 @@ task4/yolo_dataset_optuna
 task5/segmentation
 # submission files
 *.csv
+task1/FEATURE_ENGINEERING_IMPROVEMENTS.md
 # model
 *.pth
 *.pt
