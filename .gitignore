@@ -21,3 +21,15 @@ __pycache__/
 # DataSets
 neu-plant-seedling-classification-2025/
 # neu-plant-seedling-classification-num2-2025/
+task2/neu-plant-seedling-classification-num2-2025
+task3/data3
+task4/detection
+task4/runs
+task4/yolo_dataset
+task4/yolo_dataset_optuna
+task5/segmentation
+# submission files
+*.csv
+# model
+*.pth
+*.pt
